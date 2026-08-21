@@ -8,6 +8,8 @@ import json
 import logging
 import os
 
+from .audio import DEFAULT_SILENCE_DBFS, DEFAULT_SILENCE_SECONDS
+
 _logger = logging.getLogger(__name__)
 
 
@@ -21,6 +23,7 @@ class Store:
         self._data.setdefault("triggers", {})
         self._data.setdefault("notifications", True)
         self._data.setdefault("pause_when_streaming", True)
+        self._data.setdefault("audio_keepalive", {})
 
     def _read(self):
         try:
@@ -90,6 +93,27 @@ class Store:
 
     def set_pause_when_streaming(self, enabled):
         self._data["pause_when_streaming"] = bool(enabled)
+        self._save()
+
+    @property
+    def audio_keepalive(self):
+        """Whether to nudge the TV's volume once the machine has been silent for a while, plus
+        the silence budget (seconds) and the level below which the output counts as silent
+        (dBFS). Defaults off: each nudge flashes the TV's volume OSD, so it is opt-in. Read
+        key-by-key so a settings file written before the feature existed upgrades cleanly."""
+        stored = self._data.get("audio_keepalive") or {}
+        return {
+            "enabled": bool(stored.get("enabled", False)),
+            "seconds": int(stored.get("seconds", DEFAULT_SILENCE_SECONDS)),
+            "dbfs": int(stored.get("dbfs", DEFAULT_SILENCE_DBFS)),
+        }
+
+    def set_audio_keepalive(self, enabled, seconds, dbfs):
+        self._data["audio_keepalive"] = {
+            "enabled": bool(enabled),
+            "seconds": int(seconds),
+            "dbfs": int(dbfs),
+        }
         self._save()
 
     def find_tv(self, host):

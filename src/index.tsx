@@ -28,6 +28,7 @@ import { PowerControls } from "./components/PowerControls";
 import { AutoSwitch } from "./components/AutoSwitch";
 import { TriggerSettings } from "./components/TriggerSettings";
 import { NotificationSettings } from "./components/NotificationSettings";
+import { AudioKeepalive } from "./components/AudioKeepalive";
 import { Logs } from "./components/Logs";
 import { TvStatus } from "./components/TvStatus";
 import { notify, setNotify } from "./notify";
@@ -214,6 +215,10 @@ function Content() {
           <NotificationSettings />
         </>
       ) : null}
+      {/* Not gated on rules like the two above: keeping the audio path awake is about the TV
+          being on, not about auto-switching, and the backend falls back to the selected TV when
+          no rule matches a connected screen. */}
+      {selectedTv ? <AudioKeepalive /> : null}
       <PanelSection>
         <TvManage tvs={tvs} selectedHost={selectedHost} onChanged={refresh} />
         <Logs />

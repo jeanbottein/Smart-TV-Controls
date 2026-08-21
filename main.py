@@ -10,6 +10,7 @@ ROOT = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(ROOT, "backend"))
 sys.path.insert(0, os.path.join(ROOT, "py_modules"))
 
+from tv_core.audio import SilenceMonitor
 from tv_core.driver import build_registry, list_brands, select_driver
 from tv_core.edid import connected_displays
 from tv_core.logs import clear_logs, prune_logs, read_log_tail
@@ -47,6 +48,17 @@ WAKE_BURST = 3
 # in their difference larger than this (seconds) means we just resumed and should
 # forget what we've seen and re-evaluate the connected displays from scratch.
 RESUME_THRESHOLD = 10
+# An ARC soundbar drops into standby once the line has been silent for a while, and the first
+# sound after that is clipped while the audio path wakes back up. A volumeUp/volumeDown pair is
+# net-zero on the volume, but the TV relays both to the soundbar over CEC, which wakes it. How
+# long silence must last (and how quiet counts as silent) is a per-setup judgement, so both live
+# in the store — see tv_core.audio for the defaults and what a dBFS level means.
+#
+# Don't let the nudge repeat faster than this while the silence goes on: each one flashes the
+# TV's volume OSD, and this also paces the retries when the TV can't be reached.
+NUDGE_COOLDOWN = 240
+# The TV has to see two distinct volume events; sent back to back they can coalesce into one.
+NUDGE_GAP = 1.0
 
 # Keep the vendored websockets library from writing chatty connection logs.
 logging.getLogger("websockets").setLevel(logging.WARNING)
@@ -75,12 +87,21 @@ class Plugin:
         # cleared on resume, so every way of losing track of it fails *open* — auto-switch comes
         # back rather than staying disabled for good.
         self.streaming = False
+        # Measures whether this machine is emitting sound, so a long silence can nudge the TV's
+        # volume and keep an ARC soundbar awake. Started lazily by _keep_audio_awake, so a
+        # default install (the setting is off) never spawns the capture.
+        self.audio = SilenceMonitor()
+        self.last_nudge = None  # monotonic time of the last nudge *attempt*
+        self.nudging = False  # a nudge is in flight (it outlives a poll)
         self.watcher = asyncio.get_event_loop().create_task(self._watch())
 
     async def _unload(self):
         watcher = getattr(self, "watcher", None)
         if watcher is not None:
             watcher.cancel()
+        audio = getattr(self, "audio", None)
+        if audio is not None:
+            audio.stop()
         for task in list(getattr(self, "tasks", ())):
             task.cancel()
 
@@ -128,6 +149,23 @@ class Plugin:
     def _paused_by_streaming(self):
         """Whether a live Remote Play session currently holds the TV off-limits."""
         return self.streaming and self.store.pause_when_streaming
+
+    async def get_audio_keepalive(self):
+        return self.store.audio_keepalive
+
+    async def set_audio_keepalive(self, enabled: bool, seconds: int, dbfs: int):
+        self.store.set_audio_keepalive(enabled, seconds, dbfs)
+
+    async def get_audio_status(self):
+        """What the panel's readout shows, so the silence floor can be calibrated against the
+        real hardware: whether a capture is live, why not when it isn't, the most recent peak
+        level, and how long the output has been under the floor."""
+        return {
+            "running": self.audio.running,
+            "unavailable": self.audio.unavailable,
+            "silent_seconds": self.audio.silent_seconds(),
+            "peak_dbfs": round(self.audio.tracker.last_peak_dbfs, 1),
+        }
 
     async def get_notifications(self):
         return self.store.notifications
@@ -309,8 +347,16 @@ class Plugin:
                 # is stale. Clearing it here is the safety net for a missed "session stopped".
                 self.streaming = False
                 self._resumed = True  # tag the next poll's re-appearances as the "wake" trigger
+                # The capture was frozen too, so the silence it "measured" across the sleep is an
+                # artifact rather than an observation — don't nudge on the strength of it.
+                self.audio.tracker.mark_sound()
+                self.last_nudge = None
             suspended = now_suspended
             last_error = await self._poll(last_error)
+            try:
+                self._keep_audio_awake()
+            except Exception as error:  # noqa: BLE001 - a side feature must never stop the loop
+                decky.logger.warning(f"audio keep-alive failed: {error}")
             await asyncio.sleep(POLL_SECONDS)
 
     @staticmethod
@@ -404,6 +450,70 @@ class Plugin:
                 # budget expire; a brief flap just defers the attempt to a later poll.
                 self.inflight.add(did)
                 self._spawn(self._attempt(rule, did))
+
+    def _keep_audio_awake(self):
+        """Nudge the TV's volume once this machine has been silent long enough for an ARC
+        soundbar to have fallen asleep, so the next sound isn't clipped while the path wakes.
+
+        Rides the same poll as the auto-switch, and owns the capture's lifecycle: it only runs
+        while the setting is on and a TV is actually attached, because holding a capture stream
+        keeps PipeWire from suspending the sink. Cheap and non-blocking — the nudge itself is
+        spawned, since reaching the TV can take seconds and must not stall the switch loop.
+        """
+        settings = self.store.audio_keepalive
+        target = self._nudge_target() if settings["enabled"] else None
+        if target is None or self._paused_by_streaming():
+            # Nothing to keep awake — or someone is streaming from this machine, so they aren't
+            # at the TV and the soundbar may as well sleep. Drop the capture rather than pin the
+            # sink open for nobody.
+            self.audio.stop()
+            return
+        self.audio.configure(settings["dbfs"])
+        self.audio.start()
+        silent = self.audio.silent_seconds()
+        if silent is None or silent < settings["seconds"] or self.nudging:
+            return
+        now = time.monotonic()
+        if self.last_nudge is not None and now - self.last_nudge < NUDGE_COOLDOWN:
+            return
+        self.last_nudge = now  # stamped on the attempt, so an unreachable TV isn't retried every poll
+        self.nudging = True
+        self._spawn(self._nudge(target, silent))
+
+    def _nudge_target(self):
+        """The TV to keep awake: the one an enabled rule points at for a currently-connected
+        screen, since that's the TV we know is attached to something live. Falls back to the
+        selected TV for a setup with no rules at all.
+
+        Reads `seen` rather than the sysfs displays: the poll that just ran refreshed it, so this
+        adds no I/O to the loop."""
+        for display_id in self._enabled_displays(self.seen):
+            rule = next((r for r in self.store.rules if r["display_id"] == display_id), None)
+            tv = self.store.find_tv(rule["host"]) if rule else None
+            if tv is not None:
+                return tv
+        return self.store.find_tv(self.store.selected)
+
+    async def _nudge(self, tv, silent):
+        """One volume up/down round trip. Net-zero on the volume; the point is the CEC traffic
+        it makes the TV emit."""
+        try:
+            driver = select_driver(REGISTRY, tv["brand"])
+            # Only ever touch a TV that is already awake. This fires on its own schedule, so
+            # never _wake() here — powering on a TV the user deliberately turned off, in a quiet
+            # room, would be a far worse misfire than a clipped sound.
+            if not await driver.reachable(tv["host"]):
+                return
+            await driver.volume_up(tv["host"], tv["creds"])
+            await asyncio.sleep(NUDGE_GAP)
+            await driver.volume_down(tv["host"], tv["creds"])
+            # Re-arm: the next silence window starts now, not when the sound stopped.
+            self.audio.tracker.mark_sound()
+            decky.logger.info(f"audio keep-alive: nudged {tv['name']} after {int(silent)}s of silence")
+        except Exception as error:  # noqa: BLE001 - the TV may drop mid-command; retry next window
+            decky.logger.info(f"audio keep-alive nudge for {tv['name']} failed: {error}")
+        finally:
+            self.nudging = False
 
     def _spawn(self, coro):
         task = asyncio.get_event_loop().create_task(coro)

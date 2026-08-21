@@ -35,6 +35,24 @@ export interface Triggers {
   home: boolean;
 }
 
+// Nudge the TV's volume after a stretch of silence, so an ARC soundbar doesn't fall asleep and
+// clip the next sound. `dbfs` is the level below which the machine's own audio output counts as
+// silent (decibels relative to digital full scale, so always negative).
+export interface AudioKeepalive {
+  enabled: boolean;
+  seconds: number;
+  dbfs: number;
+}
+
+// Live measurement behind the settings above, so the floor can be calibrated against real gear.
+// `silent_seconds` is null while nothing is being measured; `unavailable` says why.
+export interface AudioStatus {
+  running: boolean;
+  unavailable: string;
+  silent_seconds: number | null;
+  peak_dbfs: number;
+}
+
 export interface DiscoveredTv {
   host: string;
   name: string;
@@ -51,6 +69,10 @@ export const setStreaming = callable<[active: boolean], void>("set_streaming");
 export const autoSwitchPaused = callable<[], boolean>("auto_switch_paused");
 export const getPauseWhenStreaming = callable<[], boolean>("get_pause_when_streaming");
 export const setPauseWhenStreaming = callable<[enabled: boolean], void>("set_pause_when_streaming");
+export const getAudioKeepalive = callable<[], AudioKeepalive>("get_audio_keepalive");
+export const setAudioKeepalive =
+  callable<[enabled: boolean, seconds: number, dbfs: number], void>("set_audio_keepalive");
+export const getAudioStatus = callable<[], AudioStatus>("get_audio_status");
 export const getNotifications = callable<[], boolean>("get_notifications");
 export const setNotifications = callable<[enabled: boolean], void>("set_notifications");
 export const listDisplays = callable<[], Display[]>("list_displays");
